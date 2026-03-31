@@ -516,6 +516,8 @@ Rules:
                 messages: [{ role: "user", content: "ping" }],
                 max_tokens: 1,
                 stream: false,
+                gateway_url: openclawGatewayUrl,
+                ...(openclawAuthToken ? { auth_token: openclawAuthToken } : {}),
               }),
             });
             if (!healthResp.ok) throw new Error(`Gateway returned ${healthResp.status}`);
@@ -1191,8 +1193,9 @@ Rules:
           messages: [...openclawHistoryRef.current],
           stream: true,
           signal: abortController.signal,
+          gateway_url: openclawGatewayUrl,
+          auth_token: openclawAuthToken || undefined,
         },
-        openclawAuthToken || undefined,
       )) {
         fullResponse += token;
 

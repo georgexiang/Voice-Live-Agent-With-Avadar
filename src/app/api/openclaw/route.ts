@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 export async function POST(request: NextRequest) {
-  const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL || 'http://localhost:18789';
-  const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
-
   const body = await request.json();
+
+  // Extract proxy-specific fields, fall back to env vars
+  const gatewayUrl = body.gateway_url || process.env.OPENCLAW_GATEWAY_URL || 'http://localhost:18789';
+  const gatewayToken = body.auth_token || process.env.OPENCLAW_GATEWAY_TOKEN;
+
+  // Remove proxy fields before forwarding to gateway
+  const { gateway_url: _gw, auth_token: _at, ...forwardBody } = body;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -16,7 +20,7 @@ export async function POST(request: NextRequest) {
   const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
     method: 'POST',
     headers,
-    body: JSON.stringify(body),
+    body: JSON.stringify(forwardBody),
   });
 
   if (!response.ok) {

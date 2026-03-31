@@ -9,6 +9,8 @@ export interface OpenClawStreamOptions {
   temperature?: number;
   stream: true;
   signal?: AbortSignal;
+  gateway_url?: string;
+  auth_token?: string;
 }
 
 /**
@@ -18,19 +20,19 @@ export interface OpenClawStreamOptions {
 export async function* streamOpenClawChat(
   url: string,
   options: OpenClawStreamOptions,
-  authToken?: string,
 ): AsyncGenerator<string, void, unknown> {
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
     },
     body: JSON.stringify({
       model: options.model,
       messages: options.messages,
       temperature: options.temperature ?? 0.7,
       stream: true,
+      ...(options.gateway_url ? { gateway_url: options.gateway_url } : {}),
+      ...(options.auth_token ? { auth_token: options.auth_token } : {}),
     }),
     signal: options.signal,
   });
