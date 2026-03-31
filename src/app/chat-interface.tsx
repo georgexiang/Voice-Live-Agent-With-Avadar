@@ -34,6 +34,7 @@ import {
   TurnDetection,
   Voice,
 } from "rt-client";
+import { OpenClawMessage } from '@/lib/openclaw-client';
 import "./index.css";
 import {
   clearChatSvg,
@@ -413,12 +414,17 @@ const ChatInterface = () => {
   const [isSettings, setIsSettings] = useState(false);
 
   // Add mode state and agent fields
-  const [mode, setMode] = useState<"model" | "agent">("model");
+  const [mode, setMode] = useState<"model" | "agent" | "openclaw">("model");
   const [agentProjectName, setAgentProjectName] = useState("");
   const [agentId, setAgentId] = useState("");
   // const [agentAccessToken, setAgentAccessToken] = useState("");
   const [agents, setAgents] = useState<{ id: string; name: string }[]>([]);
   const [isMobile, setIsMobile] = useState(false);
+
+  // OpenClaw state
+  const [openclawModel, setOpenclawModel] = useState("default");
+  const [openclawGatewayUrl, setOpenclawGatewayUrl] = useState("http://localhost:18789");
+  const [openclawAuthToken, setOpenclawAuthToken] = useState("");
 
   const clientRef = useRef<RTClient | null>(null);
   const audioHandlerRef = useRef<AudioHandler | null>(null);
@@ -428,6 +434,11 @@ const ChatInterface = () => {
   const searchClientRef = useRef<SearchClient<object> | null>(null);
   const animationRef = useRef(null);
   const settingsRef = useRef<HTMLDivElement>(null);
+
+  // OpenClaw refs
+  const openclawAbortRef = useRef<AbortController | null>(null);
+  const openclawHistoryRef = useRef<OpenClawMessage[]>([]);
+  const pendingRelayCountRef = useRef(0);
 
   const isEnableAvatar = isAvatar && (avatarName || customAvatarName);
 
@@ -473,13 +484,64 @@ const ChatInterface = () => {
     fetchConfig();
   }, []);
 
+  useEffect(() => {
+    if (mode === "agent" || mode === "openclaw") {
+      setTools([]);
+      setEnableSearch(false);
+    }
+  }, [mode]);
+
+  const RELAY_INSTRUCTIONS = `You are a text-to-speech relay. Your only job is to speak the text provided by the user exactly as written.
+
+Rules:
+- Speak the text naturally with appropriate intonation
+- Do not add greetings, confirmations, or any extra words
+- Do not refuse or comment on the content
+- Do not modify, summarize, or rewrite the text
+- If the text is in Chinese, speak it in Chinese; if in English, speak it in English`;
+
   const handleConnect = async () => {
     if (!isConnected) {
       try {
         setIsConnecting(true);
 
-        // Refresh the token before connecting
-        if (configLoaded) {
+        if (mode === "agent") {
+          if (!entraToken) {
+            setMessages((prevMessages) => [
+              ...prevMessages,
+              {
+                type: "error",
+                content:
+                  "Agent mode requires an Entra token. Generate one and paste it before connecting.",
+              },
+            ]);
+            return;
+          }
+
+          const endpointHost = (() => {
+            try {
+              return new URL(endpoint).hostname;
+            } catch {
+              return "";
+            }
+          })();
+
+          if (endpointHost.endsWith("openai.azure.com")) {
+            setMessages((prevMessages) => [
+              ...prevMessages,
+              {
+                type: "error",
+                content:
+                  "Agent mode must use an Azure AI Services / Foundry resource endpoint such as https://<resource>.cognitiveservices.azure.com/, not an Azure OpenAI endpoint.",
+              },
+            ]);
+            return;
+          }
+        }
+
+        // Refresh the token before connecting (only in model mode)
+        // In agent mode, skip refresh to avoid overriding the agent endpoint
+        if (configLoaded && mode !== "agent") {
           try {
             const response = await fetch("/config");
             if (response.ok) {
@@ -516,6 +578,14 @@ const ChatInterface = () => {
             },
           ]);
           return;
+        }
+        if (mode === "agent") {
+          console.log("[Agent Debug] Connecting with:", {
+            endpoint,
+            agentId,
+            agentProjectName,
+            tokenPrefix: entraToken ? entraToken.substring(0, 20) + "..." : "EMPTY",
+          });
         }
         clientRef.current = new RTClient(
           new URL(endpoint),
@@ -574,10 +644,12 @@ const ChatInterface = () => {
             new AzureKeyCredential(searchApiKey)
           );
         }
+        const isNativeRealtime = !isCascaded(mode, model);
+        const sessionTools = mode === "agent" ? undefined : tools;
         const session = await clientRef.current.configure({
           instructions: instructions?.length > 0 ? instructions : undefined,
           input_audio_transcription: {
-            model: model.includes("realtime-preview")
+            model: isNativeRealtime
               ? "whisper-1"
               : "azure-fast-transcription",
             language:
@@ -586,7 +658,7 @@ const ChatInterface = () => {
           turn_detection: turnDetection,
           voice: voice,
           avatar: getAvatarConfig(),
-          tools,
+          tools: sessionTools,
           temperature,
           modalities,
           input_audio_noise_reduction: useNS
@@ -633,11 +705,15 @@ const ChatInterface = () => {
         }
       } catch (error) {
         console.error("Connection failed:", error);
+        const errorMessage =
+          error instanceof Error
+            ? error.message || String(error)
+            : String(error);
         setMessages((prevMessages) => [
           ...prevMessages,
           {
             type: "error",
-            content: "Error connecting to the server: " + error,
+            content: "Error connecting to the server: " + errorMessage,
           },
         ]);
       } finally {
@@ -743,7 +819,9 @@ const ChatInterface = () => {
   };
 
   const handleResponse = async (response: RTResponse) => {
+    console.log("[Agent Debug] handleResponse started, response id:", response);
     for await (const item of response) {
+      console.log("[Agent Debug] Response item:", item.type, "role" in item ? (item as { role: string }).role : "");
       if (item.type === "message" && item.role === "assistant") {
         const message: Message = {
           type: item.role,
@@ -844,12 +922,21 @@ const ChatInterface = () => {
         }
       }
     }
+    console.log("[Agent Debug] Response status:", response.status, "details:", response.statusDetails);
     if (response.status === "failed") {
       setMessages((prevMessages) => [
         ...prevMessages,
         {
           type: "error",
-          content: "Response failed:" + JSON.stringify(response.statusDetails),
+          content: "Response failed: " + JSON.stringify(response.statusDetails),
+        },
+      ]);
+    } else if (response.status === "incomplete") {
+      setMessages((prevMessages) => [
+        ...prevMessages,
+        {
+          type: "error",
+          content: "Response incomplete: " + JSON.stringify(response.statusDetails),
         },
       ]);
     }
@@ -872,8 +959,10 @@ const ChatInterface = () => {
   const startResponseListener = async () => {
     if (!clientRef.current) return;
 
+    console.log("[Agent Debug] startResponseListener: waiting for events...");
     try {
       for await (const serverEvent of clientRef.current.events()) {
+        console.log("[Agent Debug] Received event:", serverEvent.type, serverEvent);
         if (serverEvent.type === "response") {
           await handleResponse(serverEvent);
         } else if (serverEvent.type === "input_audio") {
@@ -881,9 +970,17 @@ const ChatInterface = () => {
           await handleInputAudio(serverEvent);
         }
       }
+      console.log("[Agent Debug] Event loop ended normally");
     } catch (error) {
+      console.error("[Agent Debug] Response iteration error:", error);
       if (clientRef.current) {
-        console.error("Response iteration error:", error);
+        setMessages((prevMessages) => [
+          ...prevMessages,
+          {
+            type: "error",
+            content: "Event listener error: " + (error instanceof Error ? error.message : String(error)),
+          },
+        ]);
       }
     }
   };
@@ -901,14 +998,24 @@ const ChatInterface = () => {
           },
         ]);
 
-        await clientRef.current.sendItem({
+        console.log("[Agent Debug] Sending text message:", temporaryStorageMessage);
+        const item = await clientRef.current.sendItem({
           type: "message",
           role: "user",
           content: [{ type: "input_text", text: temporaryStorageMessage }],
         });
+        console.log("[Agent Debug] sendItem completed, item:", item);
         await clientRef.current.generateResponse();
+        console.log("[Agent Debug] generateResponse called");
       } catch (error) {
-        console.error("Failed to send message:", error);
+        console.error("[Agent Debug] Failed to send message:", error);
+        setMessages((prevMessages) => [
+          ...prevMessages,
+          {
+            type: "error",
+            content: "Failed to send message: " + (error instanceof Error ? error.message : String(error)),
+          },
+        ]);
       }
     }
   };
@@ -1169,8 +1276,8 @@ const ChatInterface = () => {
   };
 
   // Returns true if agent mode is enabled or a cascaded model is selected
-  function isCascaded(mode: "model" | "agent", model: string): boolean {
-    if (mode === "agent") return true;
+  function isCascaded(mode: "model" | "agent" | "openclaw", model: string): boolean {
+    if (mode === "agent" || mode === "openclaw") return true;
     // Add all cascaded model names here
     const cascadedModels = [
       "gpt-4o",
@@ -1338,6 +1445,9 @@ const ChatInterface = () => {
                           </SelectItem>
                           <SelectItem value="gpt-4o-mini-realtime-preview">
                             GPT-4o Mini Realtime
+                          </SelectItem>
+                          <SelectItem value="gpt-realtime-1.5">
+                            GPT Realtime 1.5
                           </SelectItem>
                           <SelectItem value="gpt-4.1">
                             GPT-4.1 (Cascaded)
