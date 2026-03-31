@@ -1599,7 +1599,7 @@ Rules:
                   <label className="text-sm font-medium">Mode</label>
                   <Select
                     value={mode}
-                    onValueChange={(v) => setMode(v as "model" | "agent")}
+                    onValueChange={(v) => setMode(v as "model" | "agent" | "openclaw")}
                     disabled={isConnected}
                   >
                     <SelectTrigger>
@@ -1608,6 +1608,7 @@ Rules:
                     <SelectContent>
                       <SelectItem value="model">Model</SelectItem>
                       <SelectItem value="agent">Agent</SelectItem>
+                      <SelectItem value="openclaw">OpenClaw</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -1618,7 +1619,7 @@ Rules:
                   onChange={(e) => setEndpoint(e.target.value)}
                   disabled={isConnected || configLoaded}
                 />
-                {(!configLoaded && mode === "model") && (
+                {(!configLoaded && (mode === "model" || mode === "openclaw")) && (
                   <Input
                     placeholder="Subscription Key"
                     value={apiKey}
@@ -1636,7 +1637,38 @@ Rules:
                 )}
                 {/* Entra token input */}
                 {/* Show agent fields if agent mode */}
-                {mode === "agent" ? (
+                {mode === "openclaw" ? (
+                  <div className="space-y-4">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Gateway URL</label>
+                      <Input
+                        value={openclawGatewayUrl}
+                        onChange={(e) => setOpenclawGatewayUrl(e.target.value)}
+                        placeholder="http://localhost:18789"
+                        disabled={isConnected}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Auth Token</label>
+                      <Input
+                        type="password"
+                        value={openclawAuthToken}
+                        onChange={(e) => setOpenclawAuthToken(e.target.value)}
+                        placeholder="Optional"
+                        disabled={isConnected}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Model</label>
+                      <Input
+                        value={openclawModel}
+                        onChange={(e) => setOpenclawModel(e.target.value)}
+                        placeholder="default"
+                        disabled={isConnected}
+                      />
+                    </div>
+                  </div>
+                ) : mode === "agent" ? (
                   <>
                     <div className="space-y-2">
                       <label className="text-sm font-medium">Agent</label>
@@ -1872,11 +1904,11 @@ Rules:
                     </Select>
                   </div>
                 )}
-                {/* Model instructions - only show in model mode */}
-                {mode === "model" && (
+                {/* Model/OpenClaw instructions */}
+                {(mode === "model" || mode === "openclaw") && (
                   <div className="space-y-2">
                     <label className="text-sm font-medium">
-                      Model instructions
+                      {mode === "openclaw" ? "System Prompt" : "Model instructions"}
                     </label>
                     <textarea
                       className="w-full min-h-[100px] p-2 border rounded"
