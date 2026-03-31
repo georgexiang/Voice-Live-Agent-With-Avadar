@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: 'export',
+  // output: 'export', // Removed to enable API Routes for OpenClaw proxy
   webpack: (config, { isServer }) => {
     if (isServer) {
       config.resolve.fallback = {
