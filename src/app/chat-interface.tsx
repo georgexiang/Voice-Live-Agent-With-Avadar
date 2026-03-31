@@ -505,6 +505,123 @@ Rules:
       try {
         setIsConnecting(true);
 
+        if (mode === "openclaw") {
+          // Health check: verify OpenClaw Gateway is reachable
+          try {
+            const healthResp = await fetch(`/api/openclaw`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: openclawModel,
+                messages: [{ role: "user", content: "ping" }],
+                max_tokens: 1,
+                stream: false,
+              }),
+            });
+            if (!healthResp.ok) throw new Error(`Gateway returned ${healthResp.status}`);
+          } catch (e) {
+            setMessages(prev => [...prev, {
+              type: "error",
+              content: `OpenClaw Gateway unreachable: ${e instanceof Error ? e.message : String(e)}`,
+            }]);
+            return;
+          }
+
+          // Connect to Voice Live API with nano as relay model
+          const clientAuth = entraToken
+            ? {
+              getToken: async (_: string) => ({
+                token: entraToken,
+                expiresOnTimestamp: Date.now() + 3600000,
+              }),
+            }
+            : { key: apiKey };
+
+          clientRef.current = new RTClient(
+            new URL(endpoint),
+            clientAuth,
+            {
+              modelOrAgent: "gpt-4.1-nano",
+              apiVersion: "2025-05-01-preview",
+            }
+          );
+
+          const modalities: Modality[] = ["text", "audio"];
+          const turnDetection: TurnDetection = turnDetectionType;
+          if (turnDetection && eouDetectionType !== "none") {
+            turnDetection.end_of_utterance_detection = {
+              model: eouDetectionType,
+            } as EOUDetection;
+          }
+          if (turnDetection?.type === "azure_semantic_vad") {
+            turnDetection.remove_filler_words = removeFillerWords;
+          }
+          const voice: Voice = useCNV
+            ? {
+              name: customVoiceName,
+              endpoint_id: voiceDeploymentId,
+              temperature: customVoiceName.toLowerCase().includes("dragonhd")
+                ? voiceTemperature
+                : undefined,
+              type: "azure-custom",
+            }
+            : voiceName.includes("-")
+              ? {
+                name: voiceName,
+                type: "azure-standard",
+                temperature: voiceName.toLowerCase().includes("dragonhd")
+                  ? voiceTemperature
+                  : undefined,
+              }
+              : (voiceName as Voice);
+
+          const session = await clientRef.current.configure({
+            instructions: RELAY_INSTRUCTIONS,
+            input_audio_transcription: {
+              model: "azure-fast-transcription",
+              language: recognitionLanguage === "auto" ? undefined : recognitionLanguage,
+            },
+            turn_detection: turnDetection,
+            voice: voice,
+            avatar: getAvatarConfig(),
+            tools: undefined,
+            temperature: 0,
+            modalities,
+            input_audio_noise_reduction: useNS
+              ? { type: "azure_deep_noise_suppression" }
+              : null,
+            input_audio_echo_cancellation: useEC
+              ? { type: "server_echo_cancellation" }
+              : null,
+          });
+
+          if (session?.avatar) {
+            await getLocalDescription(session.avatar?.ice_servers);
+          }
+
+          // Initialize OpenClaw conversation history
+          openclawHistoryRef.current = [];
+          if (instructions?.length > 0) {
+            openclawHistoryRef.current.push({ role: 'system', content: instructions });
+          }
+          pendingRelayCountRef.current = 0;
+
+          startOpenClawResponseListener();
+
+          if (audioHandlerRef.current) {
+            audioHandlerRef.current.startSessionRecording();
+          }
+
+          setIsConnected(true);
+          setMessages(prev => [...prev, {
+            type: "status",
+            content: `Connected to OpenClaw (model: ${openclawModel}, relay: gpt-4.1-nano)`,
+          }]);
+
+          setSessionId(session.id);
+          return;
+        }
+
         if (mode === "agent") {
           if (!entraToken) {
             setMessages((prevMessages) => [
@@ -791,6 +908,11 @@ Rules:
   };
 
   const disconnect = async () => {
+    // OpenClaw cleanup
+    openclawAbortRef.current?.abort();
+    openclawHistoryRef.current = [];
+    pendingRelayCountRef.current = 0;
+
     if (clientRef.current) {
       try {
         await clientRef.current.close();
@@ -981,6 +1103,56 @@ Rules:
             content: "Event listener error: " + (error instanceof Error ? error.message : String(error)),
           },
         ]);
+      }
+    }
+  };
+
+  const startOpenClawResponseListener = async () => {
+    if (!clientRef.current) return;
+
+    console.log("[OpenClaw] startOpenClawResponseListener: waiting for events...");
+    try {
+      for await (const serverEvent of clientRef.current.events()) {
+        if (serverEvent.type === "response") {
+          // Check if this is a nano auto-response (triggered by turn_detection)
+          // or our manually triggered relay response
+          if (pendingRelayCountRef.current > 0) {
+            pendingRelayCountRef.current--;
+            // This is our relay response — process normally
+            await handleResponse(serverEvent);
+          } else {
+            // This is nano auto-responding to user speech — cancel it
+            console.log("[OpenClaw] Cancelling nano auto-response");
+            await serverEvent.cancel();
+          }
+        } else if (serverEvent.type === "input_audio") {
+          // User finished speaking — get transcript
+          proactiveManagerRef.current?.updateActivity("user start to speak");
+          isUserSpeaking.current = true;
+          audioHandlerRef.current?.stopStreamingPlayback();
+          await serverEvent.waitForCompletion();
+          isUserSpeaking.current = false;
+
+          const transcript = serverEvent.transcription || "";
+          if (!transcript.trim()) continue;
+
+          setMessages(prev => [...prev, { type: "user", content: transcript }]);
+
+          // Cancel any in-progress OpenClaw request
+          openclawAbortRef.current?.abort();
+
+          // Send to OpenClaw (implemented in plan 02-02)
+          console.log("[OpenClaw] Transcript received:", transcript);
+          // TODO: await sendToOpenClaw(transcript);
+        }
+      }
+    } catch (error) {
+      console.error("[OpenClaw] Response listener error:", error);
+      if (clientRef.current) {
+        setMessages(prev => [...prev, {
+          type: "error",
+          content: "OpenClaw event listener error: " + (error instanceof Error ? error.message : String(error)),
+        }]);
       }
     }
   };
