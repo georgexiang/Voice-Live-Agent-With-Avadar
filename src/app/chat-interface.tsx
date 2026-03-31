@@ -34,7 +34,7 @@ import {
   TurnDetection,
   Voice,
 } from "rt-client";
-import { OpenClawMessage } from '@/lib/openclaw-client';
+import { OpenClawMessage, streamOpenClawChat, SentenceBuffer } from '@/lib/openclaw-client';
 import "./index.css";
 import {
   clearChatSvg,
@@ -1141,9 +1141,8 @@ Rules:
           // Cancel any in-progress OpenClaw request
           openclawAbortRef.current?.abort();
 
-          // Send to OpenClaw (implemented in plan 02-02)
-          console.log("[OpenClaw] Transcript received:", transcript);
-          // TODO: await sendToOpenClaw(transcript);
+          // Send to OpenClaw
+          await sendToOpenClaw(transcript);
         }
       }
     } catch (error) {
@@ -1152,6 +1151,83 @@ Rules:
         setMessages(prev => [...prev, {
           type: "error",
           content: "OpenClaw event listener error: " + (error instanceof Error ? error.message : String(error)),
+        }]);
+      }
+    }
+  };
+
+  const injectToAzureTTS = async (sentence: string) => {
+    if (!clientRef.current || !sentence.trim()) return;
+
+    pendingRelayCountRef.current++;
+    await clientRef.current.generateResponse({
+      conversation: 'none',
+      input_items: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: sentence }],
+      }],
+      instructions: RELAY_INSTRUCTIONS,
+    });
+  };
+
+  const sendToOpenClaw = async (userMessage: string) => {
+    openclawHistoryRef.current.push({ role: 'user', content: userMessage });
+
+    const abortController = new AbortController();
+    openclawAbortRef.current = abortController;
+
+    const sentenceBuffer = new SentenceBuffer();
+    let fullResponse = '';
+
+    const assistantMessage: Message = { type: "assistant", content: "" };
+    setMessages(prev => [...prev, assistantMessage]);
+
+    try {
+      for await (const token of streamOpenClawChat(
+        '/api/openclaw',
+        {
+          model: openclawModel,
+          messages: [...openclawHistoryRef.current],
+          stream: true,
+          signal: abortController.signal,
+        },
+        openclawAuthToken || undefined,
+      )) {
+        fullResponse += token;
+
+        // Update displayed message in real-time
+        assistantMessage.content = fullResponse;
+        setMessages(prev => [...prev]);
+
+        // Split into sentences and inject to TTS
+        const sentences = sentenceBuffer.push(token);
+        for (const sentence of sentences) {
+          await injectToAzureTTS(sentence);
+        }
+      }
+
+      // Flush remaining buffer
+      const remaining = sentenceBuffer.flush();
+      if (remaining) {
+        await injectToAzureTTS(remaining);
+      }
+
+      // Record assistant reply in history
+      openclawHistoryRef.current.push({ role: 'assistant', content: fullResponse });
+
+    } catch (error) {
+      if ((error as Error).name === 'AbortError') {
+        console.log('[OpenClaw] Request cancelled (user interrupted)');
+        // Still record partial response in history if any
+        if (fullResponse) {
+          openclawHistoryRef.current.push({ role: 'assistant', content: fullResponse });
+        }
+      } else {
+        console.error('[OpenClaw] Streaming error:', error);
+        setMessages(prev => [...prev, {
+          type: "error",
+          content: "OpenClaw error: " + (error instanceof Error ? error.message : String(error)),
         }]);
       }
     }
@@ -1169,6 +1245,11 @@ Rules:
             content: temporaryStorageMessage,
           },
         ]);
+
+        if (mode === "openclaw") {
+          await sendToOpenClaw(temporaryStorageMessage);
+          return;
+        }
 
         console.log("[Agent Debug] Sending text message:", temporaryStorageMessage);
         const item = await clientRef.current.sendItem({

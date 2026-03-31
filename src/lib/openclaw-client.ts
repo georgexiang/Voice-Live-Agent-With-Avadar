@@ -16,11 +16,11 @@ export interface OpenClawStreamOptions {
  * Protocol: OpenAI-compatible /v1/chat/completions with SSE.
  */
 export async function* streamOpenClawChat(
-  gatewayUrl: string,
+  url: string,
   options: OpenClawStreamOptions,
   authToken?: string,
 ): AsyncGenerator<string, void, unknown> {
-  const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
