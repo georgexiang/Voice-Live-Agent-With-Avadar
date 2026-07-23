@@ -366,9 +366,11 @@ let intervalId: NodeJS.Timeout | null = null;
 
 const ChatInterface = () => {
   const [apiKey, setApiKey] = useState("");
-  const [endpoint, setEndpoint] = useState("");
+  const [endpoint, setEndpoint] = useState("https://ai-foundry-svc2.services.ai.azure.com/");
   const [entraToken, setEntraToken] = useState("");
-  const [model, setModel] = useState("gpt-4o-realtime-preview");
+  const [modelEndpoint, setModelEndpoint] = useState("https://ai-foundry-svc2.cognitiveservices.azure.com/");
+  const [modelEntraToken, setModelEntraToken] = useState("");
+  const [model, setModel] = useState("gpt-realtime");
   const [searchEndpoint, setSearchEndpoint] = useState("");
   const [searchApiKey, setSearchApiKey] = useState("");
   const [searchIndex, setSearchIndex] = useState("");
@@ -414,9 +416,9 @@ const ChatInterface = () => {
   const [isSettings, setIsSettings] = useState(false);
 
   // Add mode state and agent fields
-  const [mode, setMode] = useState<"model" | "agent" | "openclaw">("model");
-  const [agentProjectName, setAgentProjectName] = useState("");
-  const [agentId, setAgentId] = useState("");
+  const [mode, setMode] = useState<"model" | "agent" | "openclaw">("agent");
+  const [agentProjectName, setAgentProjectName] = useState("proj-ai-foundry-svc2");
+  const [agentId, setAgentId] = useState("agent-with-skills");
   // const [agentAccessToken, setAgentAccessToken] = useState("");
   const [agents, setAgents] = useState<{ id: string; name: string }[]>([]);
   const [isMobile, setIsMobile] = useState(false);
@@ -439,6 +441,9 @@ const ChatInterface = () => {
   const openclawAbortRef = useRef<AbortController | null>(null);
   const openclawHistoryRef = useRef<OpenClawMessage[]>([]);
   const pendingRelayCountRef = useRef(0);
+  const ttsQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // Deferred resolvers: event listener signals when a relay response completes
+  const ttsResolversRef = useRef<Array<() => void>>([]);
 
   const isEnableAvatar = isAvatar && (avatarName || customAvatarName);
 
@@ -474,6 +479,17 @@ const ChatInterface = () => {
             }
           }
         }
+        if (config.model) {
+          if (config.model.endpoint) {
+            setModelEndpoint(config.model.endpoint);
+          }
+          if (config.model.token) {
+            setModelEntraToken(config.model.token);
+          }
+          if (config.model.name) {
+            setModel(config.model.name);
+          }
+        }
         setConfigLoaded(true);
       } catch (error) {
         console.error("Failed to fetch config:", error);
@@ -504,18 +520,51 @@ Rules:
     if (!isConnected) {
       try {
         setIsConnecting(true);
+        let normalizedEntraToken = entraToken.trim();
+        let normalizedModelToken = modelEntraToken.trim();
+        let connectionEndpoint = mode === "model" ? modelEndpoint : endpoint;
+        let connectionModel = model;
+
+        if (configLoaded && mode !== "openclaw") {
+          const response = await fetch("/config", { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error("Unable to refresh Azure credentials. Check Azure CLI sign-in.");
+          }
+
+          const config = await response.json();
+          if (mode === "agent") {
+            normalizedEntraToken = config.token?.trim() || "";
+            connectionEndpoint = config.endpoint?.trim() || endpoint;
+            setEntraToken(normalizedEntraToken);
+            setEndpoint(connectionEndpoint);
+          } else if (config.model) {
+            normalizedModelToken = config.model.token?.trim() || "";
+            connectionEndpoint = config.model.endpoint?.trim() || modelEndpoint;
+            connectionModel = config.model.name?.trim() || model;
+            setModelEntraToken(normalizedModelToken);
+            setModelEndpoint(connectionEndpoint);
+            setModel(connectionModel);
+          }
+        }
 
         if (mode === "openclaw") {
-          // Health check: verify OpenClaw Gateway is reachable
+          // Validate Azure endpoint (needed for TTS/Avatar relay)
+          if (!endpoint?.trim()) {
+            setMessages(prev => [...prev, {
+              type: "error",
+              content: "Azure AI Services Endpoint is required for OpenClaw mode (used for TTS/Avatar relay).",
+            }]);
+            setIsConnecting(false);
+            return;
+          }
+
+          // Health check: verify OpenClaw Gateway is reachable via WS auth (no chat message)
           try {
             const healthResp = await fetch(`/api/openclaw`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                model: openclawModel,
-                messages: [{ role: "user", content: "ping" }],
-                max_tokens: 1,
-                stream: false,
+                health_check: true,
                 gateway_url: openclawGatewayUrl,
                 ...(openclawAuthToken ? { auth_token: openclawAuthToken } : {}),
               }),
@@ -607,6 +656,8 @@ Rules:
             openclawHistoryRef.current.push({ role: 'system', content: instructions });
           }
           pendingRelayCountRef.current = 0;
+          ttsQueueRef.current = Promise.resolve();
+          ttsResolversRef.current = [];
 
           startOpenClawResponseListener();
 
@@ -625,13 +676,24 @@ Rules:
         }
 
         if (mode === "agent") {
-          if (!entraToken) {
+          if (!normalizedEntraToken) {
             setMessages((prevMessages) => [
               ...prevMessages,
               {
                 type: "error",
                 content:
-                  "Agent mode requires an Entra token. Generate one and paste it before connecting.",
+                  "Agent mode requires an Entra token. Run `az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv`, then paste the result into Entra Token.",
+              },
+            ]);
+            return;
+          }
+
+          if (!agentProjectName.trim()) {
+            setMessages((prevMessages) => [
+              ...prevMessages,
+              {
+                type: "error",
+                content: "Agent mode requires an Agent Project Name.",
               },
             ]);
             return;
@@ -658,32 +720,13 @@ Rules:
           }
         }
 
-        // Refresh the token before connecting (only in model mode)
-        // In agent mode, skip refresh to avoid overriding the agent endpoint
-        if (configLoaded && mode !== "agent") {
-          try {
-            const response = await fetch("/config");
-            if (response.ok) {
-              const config = await response.json();
-              if (config.endpoint) {
-                setEndpoint(config.endpoint);
-              }
-              if (config.token) {
-                setEntraToken(config.token);
-              }
-            }
-          } catch (error) {
-            console.error("Failed to refresh token:", error);
-            // Continue with existing token if refresh fails
-          }
-        }
-
         // Use agent fields if in agent mode
-        const clientAuth = entraToken
+        const activeToken = mode === "model" ? normalizedModelToken : normalizedEntraToken;
+        const clientAuth = activeToken
           ? {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             getToken: async (_: string) => ({
-              token: entraToken,
+              token: activeToken,
               expiresOnTimestamp: Date.now() + 3600000,
             }),
           }
@@ -700,26 +743,26 @@ Rules:
         }
         if (mode === "agent") {
           console.log("[Agent Debug] Connecting with:", {
-            endpoint,
+            endpoint: connectionEndpoint,
             agentId,
             agentProjectName,
-            tokenPrefix: entraToken ? entraToken.substring(0, 20) + "..." : "EMPTY",
+            tokenPresent: Boolean(normalizedEntraToken),
           });
         }
         clientRef.current = new RTClient(
-          new URL(endpoint),
+          new URL(connectionEndpoint),
           clientAuth,
           mode === "agent"
             ? {
               modelOrAgent: {
                 agentId,
-                projectName: agentProjectName,
-                agentAccessToken: entraToken,
+                projectName: agentProjectName.trim(),
+                agentAccessToken: normalizedEntraToken,
               },
               apiVersion: "2025-05-01-preview",
             }
             : {
-              modelOrAgent: model,
+              modelOrAgent: connectionModel,
               apiVersion: "2025-05-01-preview",
             }
         );
@@ -914,6 +957,9 @@ Rules:
     openclawAbortRef.current?.abort();
     openclawHistoryRef.current = [];
     pendingRelayCountRef.current = 0;
+    ttsQueueRef.current = Promise.resolve();
+    ttsResolversRef.current.forEach(r => r()); // unblock any pending
+    ttsResolversRef.current = [];
 
     if (clientRef.current) {
       try {
@@ -938,6 +984,27 @@ Rules:
         }
       } catch (error) {
         console.error("Disconnect failed:", error);
+      }
+    }
+  };
+
+  // Audio-only relay handler: plays TTS audio without adding message bubbles.
+  // Used in OpenClaw mode where text is already shown by sendToOpenClaw.
+  const handleRelayResponse = async (response: RTResponse) => {
+    for await (const item of response) {
+      if (item.type === "message" && item.role === "assistant") {
+        for await (const content of item) {
+          if (content.type === "audio") {
+            audioHandlerRef.current?.stopStreamingPlayback();
+            audioHandlerRef.current?.startStreamingPlayback();
+            for await (const audio of content.audioChunks()) {
+              audioHandlerRef.current?.playChunk(audio, async () => {
+                proactiveManagerRef.current?.updateActivity("agent speaking");
+              });
+            }
+          }
+          // Skip text content — already displayed by sendToOpenClaw
+        }
       }
     }
   };
@@ -1120,8 +1187,12 @@ Rules:
           // or our manually triggered relay response
           if (pendingRelayCountRef.current > 0) {
             pendingRelayCountRef.current--;
-            // This is our relay response — process normally
-            await handleResponse(serverEvent);
+            // This is our TTS relay response — only play audio, don't add message bubbles
+            // (text is already displayed by sendToOpenClaw)
+            await handleRelayResponse(serverEvent);
+            // Signal TTS queue that this response is done
+            const resolver = ttsResolversRef.current.shift();
+            if (resolver) resolver();
           } else {
             // This is nano auto-responding to user speech — cancel it
             console.log("[OpenClaw] Cancelling nano auto-response");
@@ -1161,16 +1232,33 @@ Rules:
   const injectToAzureTTS = async (sentence: string) => {
     if (!clientRef.current || !sentence.trim()) return;
 
-    pendingRelayCountRef.current++;
-    await clientRef.current.generateResponse({
-      conversation: 'none',
-      input_items: [{
+    // Serialize TTS requests — Azure Realtime API only allows one active response at a time.
+    // Each job waits for the event listener to signal the previous response is fully done.
+    const job = ttsQueueRef.current.then(async () => {
+      if (!clientRef.current) return;
+
+      // Create a promise that the event listener will resolve when this response completes
+      const done = new Promise<void>((resolve) => {
+        ttsResolversRef.current.push(resolve);
+      });
+
+      pendingRelayCountRef.current++;
+      await clientRef.current.sendItem({
         type: "message",
         role: "user",
         content: [{ type: "input_text", text: sentence }],
-      }],
-      instructions: RELAY_INSTRUCTIONS,
+      });
+      await clientRef.current.generateResponse({
+        instructions: RELAY_INSTRUCTIONS,
+      });
+
+      // Wait for the event listener to fully process the response
+      await done;
+    }).catch((err) => {
+      console.warn("[OpenClaw] TTS queue error:", err);
     });
+    ttsQueueRef.current = job;
+    // Don't await job here — let sentences queue up without blocking the stream
   };
 
   const sendToOpenClaw = async (userMessage: string) => {
@@ -1566,7 +1654,7 @@ Rules:
         ref={settingsRef}
       >
         <div className="flex-1 overflow-y-auto">
-          <Accordion type="single" collapsible className="space-y-4">
+          <Accordion type="single" collapsible className="space-y-4" defaultValue="connection">
             {/* Instructions */}
             <AccordionItem value="instructions">
               <AccordionTrigger className="text-lg font-semibold">
@@ -1618,8 +1706,8 @@ Rules:
                 {/* Always show endpoint and subscription key */}
                 <Input
                   placeholder="Azure AI Services Endpoint"
-                  value={endpoint}
-                  onChange={(e) => setEndpoint(e.target.value)}
+                  value={mode === "model" ? modelEndpoint : endpoint}
+                  onChange={(e) => mode === "model" ? setModelEndpoint(e.target.value) : setEndpoint(e.target.value)}
                   disabled={isConnected || configLoaded}
                 />
                 {(!configLoaded && (mode === "model" || mode === "openclaw")) && (
@@ -1630,13 +1718,20 @@ Rules:
                     disabled={isConnected}
                   />
                 )}
-                { mode === "agent" && (
+                {mode === "agent" && !configLoaded && (
                   <Input
+                    type="password"
                     placeholder="Entra Token"
                     value={entraToken}
                     onChange={(e) => setEntraToken(e.target.value)}
+                    autoComplete="off"
                     disabled={isConnected}
                   />
+                )}
+                {mode === "agent" && configLoaded && (
+                  <p className="text-sm text-muted-foreground">
+                    Entra Token loaded from local configuration.
+                  </p>
                 )}
                 {/* Entra token input */}
                 {/* Show agent fields if agent mode */}
@@ -1728,14 +1823,8 @@ Rules:
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="gpt-4o-realtime-preview">
-                            GPT-4o Realtime
-                          </SelectItem>
-                          <SelectItem value="gpt-4o-mini-realtime-preview">
-                            GPT-4o Mini Realtime
-                          </SelectItem>
-                          <SelectItem value="gpt-realtime-1.5">
-                            GPT Realtime 1.5
+                          <SelectItem value="gpt-realtime">
+                            GPT Realtime
                           </SelectItem>
                           <SelectItem value="gpt-4.1">
                             GPT-4.1 (Cascaded)

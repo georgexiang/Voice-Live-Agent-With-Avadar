@@ -34,3 +34,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# GSD development workflow (local install)
+.github/get-shit-done/
+.github/agents/
+.github/skills/
+.github/gsd-file-manifest.json
+.github/copilot-instructions.md
+.planning/
